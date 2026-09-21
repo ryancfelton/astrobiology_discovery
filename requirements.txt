@@ -1,0 +1,7 @@
+streamlit>=1.40
+requests>=2.31
+arxiv>=2.1
+numpy>=1.26
+sentence-transformers>=3.4
+transformers>=4.48.3
+torch>=2.2
