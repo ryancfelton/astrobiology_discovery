@@ -757,7 +757,7 @@ with st.sidebar:
 
     st.divider()
 
-   st.caption(
+    st.caption(
         "Embedding model: "
         "[`nasa-impact/indus-sde-st-v0.2`]"
         "(https://huggingface.co/nasa-impact/indus-sde-st-v0.2)"
