@@ -386,6 +386,10 @@ def pds_resource_type(product_class: str, collection_type: str) -> str:
         if collection_type and collection_type.lower() == "data":
             return "PDS Dataset / Collection"
         return "PDS Collection"
+    if product_class in {"Product_Data_Set", "Product_Data_Set_PDS3"}:
+        return "PDS Dataset"
+    if product_class == "Product_Resource":
+        return "PDS Scientific Resource"
     return "PDS Resource"
 
 
@@ -687,7 +691,14 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
     if is_doc and not allow_documentation:
         return None
 
-    if product_class not in {"Product_Bundle", "Product_Collection", "Product_Document"}:
+    if product_class not in {
+        "Product_Bundle",
+        "Product_Collection",
+        "Product_Document",
+        "Product_Data_Set",
+        "Product_Data_Set_PDS3",
+        "Product_Resource",
+    }:
         return None
 
     lid = pds_first(
@@ -822,16 +833,21 @@ def pds_search_class(
     limit: int = 100,
 ) -> List[dict]:
     """
-    Search a specific high-level PDS class.
+    Search one PDS high-level class endpoint.
 
-    PDS documents the class endpoints as bundles, collections, documents,
-    observationals, and any. q handles structured metadata constraints such as
-    target_name eq "Titan"; keywords searches title/description text.
+    We use this for bundles and collections. Query strings are wrapped in
+    parentheses because the current PDS query parser is most reliable with the
+    documented grouped syntax.
     """
     endpoint = f"{PDS_API_BASE}/classes/{class_name}"
-    params = {"limit": min(max(limit, 1), 100)}
+    params = {"limit": min(max(limit, 1), 1000)}
+
     if q:
+        q = q.strip()
+        if not (q.startswith("(") and q.endswith(")")):
+            q = f"({q})"
         params["q"] = q
+
     if keywords:
         params["keywords"] = keywords
 
@@ -842,9 +858,106 @@ def pds_search_class(
         timeout=30,
     )
     response.raise_for_status()
+
     payload = response.json()
     data = payload.get("data", [])
     return data if isinstance(data, list) else []
+
+
+def pds_search_products(
+    *,
+    q: str = "",
+    keywords: str = "",
+    limit: int = 500,
+) -> List[dict]:
+    """
+    Search the general PDS /products endpoint.
+
+    This endpoint is our compatibility/fallback path and is also used for
+    Product_Document records because the dedicated documents class endpoint
+    has not behaved consistently in live deployment.
+    """
+    endpoint = f"{PDS_API_BASE}/products"
+    params = {"limit": min(max(limit, 1), 1000)}
+
+    if q:
+        q = q.strip()
+        if not (q.startswith("(") and q.endswith(")")):
+            q = f"({q})"
+        params["q"] = q
+
+    if keywords:
+        params["keywords"] = keywords
+
+    response = requests.get(
+        endpoint,
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else []
+
+
+def raw_pds_product_class(item: dict) -> str:
+    """Read a product class cheaply before doing the full PDS parse."""
+    top_type = clean_text(str(item.get("type", "")))
+    if top_type:
+        return top_type
+
+    return pds_first(
+        item,
+        [
+            "product_class",
+            "pds:Identification_Area.pds:product_class",
+        ],
+    )
+
+
+def pds_selected_raw_item(
+    item: dict,
+    *,
+    include_data: bool,
+    include_documents: bool,
+) -> bool:
+    """Keep only high-level PDS resources requested by the user."""
+    product_class = raw_pds_product_class(item)
+    collection_type = get_pds_collection_type(item)
+
+    if product_class == "Product_Document":
+        return include_documents
+
+    if product_class == "Product_Collection":
+        if collection_type and collection_type.lower() == "document":
+            return include_documents
+        return include_data
+
+    if product_class in {
+        "Product_Bundle",
+        "Product_Data_Set",
+        "Product_Data_Set_PDS3",
+        "Product_Resource",
+    }:
+        return include_data
+
+    return False
+
+
+def pds_document_query(target: str = "") -> str:
+    class_clause = (
+        'pds:Identification_Area.pds:product_class eq "Product_Document"'
+    )
+
+    if target:
+        return (
+            f'(({class_clause}) and '
+            f'(target_name eq "{target}"))'
+        )
+
+    return f"({class_clause})"
 
 
 def fetch_pds(
@@ -854,124 +967,192 @@ def fetch_pds(
     include_documents: bool,
 ) -> List[dict]:
     """
-    Build a broad, scientifically plausible PDS candidate pool BEFORE INDUS.
+    Build a broad PDS candidate pool before INDUS reranking.
 
-    If the user's query names a recognized planetary target, the app queries
-    PDS's structured target_name field directly for bundles/collections (and
-    documents if requested). This avoids the old failure mode where the first
-    mixed keyword page contained few high-level products.
+    Retrieval strategy:
+      1. Recognize explicit planetary targets in the user's question.
+      2. Query bundles/collections by structured target metadata.
+      3. Query Product_Document through /products rather than the less reliable
+         dedicated documents endpoint.
+      4. Always run broad /products keyword fallbacks for the target and science
+         concepts, with a much larger result limit than the old implementation.
+      5. Filter to high-level resources locally, then let INDUS rank relevance.
 
-    INDUS-SDE-ST then reranks this broad candidate pool against the full user
-    question, e.g. target-only Titan candidates are reranked for methane.
+    This deliberately favors robust candidate generation over trusting a single
+    PDS endpoint or a shallow first page of mixed products.
     """
-    classes = []
-    if include_data:
-        classes.extend(PDS_DATA_CLASSES)
-    if include_documents:
-        classes.extend(PDS_DOCUMENT_CLASSES)
-    classes = list(dict.fromkeys(classes))
-
-    if not classes:
+    if not include_data and not include_documents:
         return []
 
     targets = detect_pds_targets(query)
     concepts = pds_concept_terms(query, targets, max_terms=5)
 
-    # We intentionally over-fetch from PDS because INDUS needs a meaningful
-    # candidate pool to rerank. The final UI still shows only results_to_show.
-    target_limit = min(100, max(50, rows * 2))
-    concept_limit = min(100, max(30, rows))
-
     raw_items = []
     seen_raw = set()
     errors = []
+    successful_calls = 0
+    fallback_calls = 0
 
     def add_items(items):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            raw_id = clean_text(str(item.get("id") or item.get("lidvid") or item.get("title") or ""))
+
+            raw_id = clean_text(
+                str(
+                    item.get("id")
+                    or item.get("lidvid")
+                    or item.get("lid")
+                    or item.get("title")
+                    or ""
+                )
+            )
+
             if not raw_id:
                 raw_id = str(hash(str(item)))
+
             if raw_id in seen_raw:
                 continue
+
+            if not pds_selected_raw_item(
+                item,
+                include_data=include_data,
+                include_documents=include_documents,
+            ):
+                continue
+
             seen_raw.add(raw_id)
             raw_items.append(item)
 
-    # 1) STRUCTURED TARGET RETRIEVAL — the important fix.
-    #    Example: target_name eq "Titan" directly asks PDS for Titan resources.
+    # --------------------------------------------------------
+    # 1) STRUCTURED TARGET SEARCHES
+    # --------------------------------------------------------
+    # Parentheses are intentional: PDS documents grouped query syntax and the
+    # live parser has been more reliable with explicit grouping.
     for target in targets:
-        q = f'target_name eq "{target}"'
-        for class_name in classes:
-            try:
-                add_items(
-                    pds_search_class(
-                        class_name,
-                        q=q,
-                        limit=target_limit,
-                    )
-                )
-            except Exception as exc:
-                errors.append(f"{class_name} target={target}: {exc}")
+        target_q = f'(target_name eq "{target}")'
 
-        # 2) TARGET + CONCEPT SEARCHES — useful when descriptions explicitly
-        #    mention methane, atmosphere, organics, etc.
-        for concept in concepts[:3]:
-            for class_name in classes:
+        if include_data:
+            for class_name in ["bundles", "collections"]:
                 try:
                     add_items(
                         pds_search_class(
                             class_name,
-                            q=q,
-                            keywords=concept,
-                            limit=concept_limit,
+                            q=target_q,
+                            limit=250,
                         )
                     )
+                    successful_calls += 1
                 except Exception as exc:
-                    errors.append(f"{class_name} target={target} keyword={concept}: {exc}")
+                    errors.append(
+                        f"{class_name} structured target={target}: {exc}"
+                    )
 
-    # 3) KEYWORD DISCOVERY — catches resources when no target is recognized and
-    #    adds cross-target material that is semantically relevant to the query.
-    keyword_queries = []
-    if query.strip():
-        keyword_queries.append(query.strip())
-    keyword_queries.extend(concepts if targets else informative_terms(query, max_terms=6))
-    keyword_queries = list(dict.fromkeys([q for q in keyword_queries if q]))
-
-    # Avoid making too many network calls while still broadening the pool.
-    for keyword in keyword_queries[:5]:
-        for class_name in classes:
+        if include_documents:
             try:
                 add_items(
-                    pds_search_class(
-                        class_name,
-                        keywords=keyword,
-                        limit=concept_limit,
+                    pds_search_products(
+                        q=pds_document_query(target),
+                        limit=250,
                     )
                 )
+                successful_calls += 1
             except Exception as exc:
-                errors.append(f"{class_name} keyword={keyword}: {exc}")
+                errors.append(
+                    f"documents structured target={target}: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # 2) HIGH-LIMIT TARGET KEYWORD FALLBACK
+    # --------------------------------------------------------
+    # This is important. Even when structured metadata calls fail or PDS has
+    # incomplete target indexing, a broad keyword call for "Titan", "Europa",
+    # etc. can still expose bundles, collections, and documents whose titles or
+    # descriptions mention that world.
+    for target in targets:
+        try:
+            add_items(
+                pds_search_products(
+                    keywords=target,
+                    limit=750,
+                )
+            )
+            successful_calls += 1
+            fallback_calls += 1
+        except Exception as exc:
+            errors.append(
+                f"products keyword target={target}: {exc}"
+            )
+
+    # --------------------------------------------------------
+    # 3) SCIENCE-CONCEPT KEYWORD DISCOVERY
+    # --------------------------------------------------------
+    # Search full question plus a few useful concepts. We use /products here
+    # because it is the broadest and most stable PDS discovery path, then
+    # locally keep only the selected high-level resource types.
+    keyword_queries = []
+
+    if query.strip():
+        keyword_queries.append(query.strip())
+
+    keyword_queries.extend(concepts)
+
+    if not targets:
+        keyword_queries.extend(informative_terms(query, max_terms=6))
+
+    keyword_queries = list(
+        dict.fromkeys([term for term in keyword_queries if term])
+    )
+
+    for keyword in keyword_queries[:6]:
+        try:
+            add_items(
+                pds_search_products(
+                    keywords=keyword,
+                    limit=500,
+                )
+            )
+            successful_calls += 1
+            fallback_calls += 1
+        except Exception as exc:
+            errors.append(
+                f"products keyword={keyword}: {exc}"
+            )
+
+    # --------------------------------------------------------
+    # 4) DOCUMENT COVERAGE
+    # --------------------------------------------------------
+    # Documentation is already captured by the high-limit /products keyword
+    # fallbacks above. We intentionally avoid extra Product_Document + keyword
+    # compound queries here because that route has been inconsistent on the
+    # live PDS service.
 
     parsed = []
+
     for item in raw_items:
-        record = parse_pds_record(item, allow_documentation=include_documents)
+        record = parse_pds_record(
+            item,
+            allow_documentation=include_documents,
+        )
+
         if record:
             parsed.append(record)
 
     parsed = deduplicate_resources(parsed)
 
-    # Store diagnostics for the Streamlit status panel without failing the whole
-    # search if one supplemental PDS call errors.
     st.session_state["pds_diagnostics"] = {
         "targets": targets,
         "concepts": concepts,
         "raw_count": len(raw_items),
         "parsed_count": len(parsed),
+        "successful_calls": successful_calls,
+        "fallback_calls": fallback_calls,
         "errors": errors,
     }
 
-    # Keep a broad but bounded candidate pool for INDUS reranking.
-    return parsed[: min(300, max(rows * 6, rows))]
+    # Give INDUS a genuinely broad PDS candidate pool. The UI still shows only
+    # results_to_show after all sources have been reranked together.
+    return parsed[: min(500, max(rows * 10, rows))]
 
 
 # ============================================================
@@ -1207,11 +1388,12 @@ if search_clicked:
 
         status.update(label="Discovery complete", state="complete")
 
-    pds_diag_errors = st.session_state.get("pds_diagnostics", {}).get("errors", [])
-    if pds_diag_errors:
+    pds_diag = st.session_state.get("pds_diagnostics", {})
+    pds_diag_errors = pds_diag.get("errors", [])
+    if pds_diag_errors and pds_diag.get("parsed_count", 0) == 0:
         errors.append(
-            f"NASA PDS supplemental calls: {len(pds_diag_errors)} request(s) failed; "
-            "other PDS results were retained."
+            "NASA PDS did not return any usable high-level resources. "
+            f"{len(pds_diag_errors)} PDS request(s) failed."
         )
 
     if errors:
