@@ -505,17 +505,3 @@ if search_clicked:
             )
 
         st.divider()
-
-with st.expander("About this prototype"):
-    st.markdown(
-        """
-This prototype uses NASA-IMPACT's public **INDUS-SDE-ST** sentence-transformer checkpoint as a semantic
-reranker. Source APIs first provide a broad candidate set. INDUS then embeds the research question and
-each candidate title/abstract. A second set of INDUS embeddings represents core astrobiology themes,
-creating an adjustable **Astrobiology Lens** in the final ranking.
-
-The current version intentionally does **not** fine-tune INDUS or use a generative LLM. That makes it
-possible to evaluate whether the released NASA scientific retrieval model already transfers well to
-astrobiology before introducing new training.
-        """
-    )
