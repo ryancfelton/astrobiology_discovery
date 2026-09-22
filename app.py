@@ -126,6 +126,17 @@ PDS_TARGET_ALIASES = {
 PDS_DATA_CLASSES = ["bundles", "collections"]
 PDS_DOCUMENT_CLASSES = ["documents"]
 
+# The PDS Collection class includes many infrastructure/support collections
+# (Context, Document, XML Schema, Miscellaneous, etc.) that are not useful
+# as scientific data-discovery results.  Keep only data-like collection types
+# behind the "PDS datasets / collections" checkbox.
+PDS_SCIENCE_COLLECTION_TYPES = {
+    "data",
+    "calibration",
+    "geometry",
+    "spice kernel",
+}
+
 
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
@@ -373,6 +384,51 @@ def preferred_direct_file(file_urls: List[str]) -> str:
 
 def get_pds_collection_type(item: dict) -> str:
     return pds_first(item, ["collection_type", "pds:Collection.pds:collection_type"])
+
+
+def pds_is_context_registry_product(item: dict) -> bool:
+    """
+    Reject PDS context-registry/infrastructure records before INDUS ranking.
+
+    The federated PDS index contains collections whose job is to catalogue
+    missions, instruments, agencies, targets, etc.  They can match words such
+    as Titan or Cassini but they are metadata infrastructure, not the science
+    resources this app is trying to surface.
+    """
+    collection_type = get_pds_collection_type(item).strip().lower()
+    if collection_type == "context":
+        return True
+
+    identifiers = pds_values(
+        item,
+        [
+            "lid",
+            "lidvid",
+            "id",
+            "pds:Identification_Area.pds:logical_identifier",
+        ],
+    )
+
+    for identifier in identifiers:
+        lower_id = identifier.lower()
+        # Covers NASA and partner-agency identifiers such as
+        # urn:nasa:pds:context:... and urn:isro:isda:context:...
+        if re.search(r":context(?::|$)", lower_id):
+            return True
+
+    title = pds_first(
+        item,
+        ["title", "pds:Identification_Area.pds:title"],
+    )
+    description = get_pds_description(item)
+    combined = f"{title} {description}".lower()
+
+    if "context products" in combined:
+        return True
+    if "bundle context" in combined:
+        return True
+
+    return False
 
 
 def pds_resource_type(product_class: str, collection_type: str) -> str:
@@ -682,14 +738,26 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
             ["product_class", "pds:Identification_Area.pds:product_class"],
         )
 
+    # Context registry records are metadata infrastructure, not science results.
+    if pds_is_context_registry_product(item):
+        return None
+
     collection_type = get_pds_collection_type(item)
+    collection_type_lower = collection_type.strip().lower()
+
     is_doc = (
         product_class == "Product_Document"
-        or (product_class == "Product_Collection" and collection_type.lower() == "document")
+        or (product_class == "Product_Collection" and collection_type_lower == "document")
     )
 
     if is_doc and not allow_documentation:
         return None
+
+    if product_class == "Product_Collection" and not is_doc:
+        # Do not surface Context, Miscellaneous, XML Schema, External, Browse,
+        # or other infrastructure/support collections as scientific datasets.
+        if collection_type_lower not in PDS_SCIENCE_COLLECTION_TYPES:
+            return None
 
     if product_class not in {
         "Product_Bundle",
@@ -697,7 +765,6 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
         "Product_Document",
         "Product_Data_Set",
         "Product_Data_Set_PDS3",
-        "Product_Resource",
     }:
         return None
 
@@ -923,23 +990,35 @@ def pds_selected_raw_item(
     include_data: bool,
     include_documents: bool,
 ) -> bool:
-    """Keep only high-level PDS resources requested by the user."""
+    """Keep only user-facing scientific PDS resources requested by the user."""
+    # The PDS index also contains context registries (missions, instruments,
+    # agencies, targets, etc.).  Those can match a planetary query but are not
+    # scientific datasets/resources, so reject them before INDUS sees them.
+    if pds_is_context_registry_product(item):
+        return False
+
     product_class = raw_pds_product_class(item)
-    collection_type = get_pds_collection_type(item)
+    collection_type = get_pds_collection_type(item).strip().lower()
 
     if product_class == "Product_Document":
         return include_documents
 
     if product_class == "Product_Collection":
-        if collection_type and collection_type.lower() == "document":
+        if collection_type == "document":
             return include_documents
-        return include_data
+
+        if not include_data:
+            return False
+
+        # Product_Collection is broader than "dataset": PDS permits Context,
+        # Miscellaneous, XML Schema, External, Browse, etc.  Only keep data-like
+        # scientific collection types for the datasets/collections checkbox.
+        return collection_type in PDS_SCIENCE_COLLECTION_TYPES
 
     if product_class in {
         "Product_Bundle",
         "Product_Data_Set",
         "Product_Data_Set_PDS3",
-        "Product_Resource",
     }:
         return include_data
 
@@ -1177,7 +1256,11 @@ with st.sidebar:
     source_pds_data = st.checkbox(
         "PDS datasets / collections",
         value=True,
-        help="Search PDS bundles and collections using structured target metadata plus text discovery.",
+        help=(
+            "Search PDS bundles and data-like collections. Context registries, "
+            "schema collections, miscellaneous infrastructure collections, and "
+            "documentation are excluded from this option."
+        ),
     )
     source_pds_docs = st.checkbox(
         "PDS documentation",
