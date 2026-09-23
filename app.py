@@ -91,7 +91,7 @@ ASTROBIOLOGY_LENSES: Dict[str, str] = {
 # ============================================================
 
 STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could",
+    "a", "an", "and", "are", "as", "at", "be", "by", "about", "can", "could",
     "do", "does", "for", "from", "how", "in", "into", "is", "it", "of",
     "on", "or", "that", "the", "their", "these", "this", "to", "what",
     "when", "where", "which", "with", "would", "relevant", "using", "use",
@@ -1076,6 +1076,8 @@ def pds_archive_search(
         "q": query,
         "rows": min(max(rows, 1), 500),
         "start": max(start, 0),
+        # Force the search service to return its Solr-style JSON payload.
+        "wt": "json",
     }
 
     response = requests.get(
@@ -1091,6 +1093,35 @@ def pds_archive_search(
     return docs if isinstance(docs, list) else []
 
 
+def pds_item_matches_targets(item: dict, targets: List[str]) -> bool:
+    """
+    For a recognized target such as Titan, keep records whose structured
+    target metadata contains that body. If target metadata is absent, allow a
+    title/description match as a fallback.
+    """
+    if not targets:
+        return True
+
+    wanted = {target.strip().lower() for target in targets if target.strip()}
+    item_targets = {
+        value.strip().lower()
+        for value in pds_values(item, ["target_name", "pds:Target_Identification.pds:name"])
+        if value.strip()
+    }
+
+    if item_targets:
+        return bool(wanted & item_targets)
+
+    fallback_text = " ".join(
+        [
+            pds_first(item, ["title", "pds:Identification_Area.pds:title"]),
+            get_pds_description(item),
+        ]
+    ).lower()
+
+    return any(re.search(rf"\b{re.escape(target.lower())}\b", fallback_text) for target in targets)
+
+
 def fetch_pds(
     query: str,
     rows: int,
@@ -1098,16 +1129,24 @@ def fetch_pds(
     include_documents: bool,
 ) -> List[dict]:
     """
-    Build a high-level PDS candidate pool using the archive's Data Set Keyword
-    Search service, then let INDUS-SDE-ST perform semantic reranking.
+    Build a high-level PDS candidate pool from the public PDS archive keyword
+    search, then let INDUS-SDE-ST perform semantic reranking.
 
-    Strategy:
-      1. Detect explicit planetary targets (Titan, Europa, Mars, etc.).
-      2. Retrieve high-level records by target and product class.
-      3. Run target + science-concept searches (e.g. target:Titan AND methane).
-      4. Run a general text fallback for queries without a recognized target.
-      5. Locally reject context/schema/infrastructure records and retain only
-         the resource types selected by the user.
+    Important design choice:
+    ------------------------
+    The PDS archive search has useful structured metadata on each result, but
+    its fielded query syntax has proven brittle in this prototype.  Therefore
+    we deliberately use broad lexical retrieval (for example ``Titan`` and
+    ``methane Titan``), then filter the returned records locally using
+    ``target_name``, ``product_class``, and ``collection_type``.
+
+    For ``Tell me about methane on Titan`` this means:
+      * retrieve a broad Titan pool;
+      * retrieve methane + Titan and methane pools;
+      * keep genuine Titan bundles/data collections/PDS3 datasets (plus
+        documentation if requested);
+      * remove Context/XML-schema/support collections;
+      * let INDUS rank the surviving scientific resources semantically.
     """
     if not include_data and not include_documents:
         return []
@@ -1115,14 +1154,50 @@ def fetch_pds(
     targets = detect_pds_targets(query)
     concepts = pds_concept_terms(query, targets, max_terms=5)
 
-    raw_items = []
+    # Build broad archive-search strings.  Do NOT use target: or product-class:
+    # here; the result metadata is more reliable than the fielded query parser.
+    search_terms = []
+
+    for target in targets:
+        search_terms.append(target)
+        for concept in concepts:
+            search_terms.append(f"{concept} {target}")
+
+    # Concept-only queries recover older PDS3 records whose target indexing can
+    # be incomplete or whose text is much more specific than the target query.
+    search_terms.extend(concepts)
+
+    # Full user wording is a final lexical fallback.
+    if query.strip():
+        search_terms.append(query.strip())
+
+    if not search_terms:
+        search_terms.extend(informative_terms(query, max_terms=6))
+
+    search_terms = list(dict.fromkeys(term for term in search_terms if term))
+
+    raw_api_hits = 0
+    retained_raw = []
     seen_raw = set()
     errors = []
     successful_calls = 0
 
-    def add_items(items):
+    for search_text in search_terms[:8]:
+        try:
+            # A target like Titan has only a few hundred high-level archive
+            # records, so a 500-record window is intentionally broad here.
+            items = pds_archive_search(search_text, rows=500)
+            successful_calls += 1
+            raw_api_hits += len(items)
+        except Exception as exc:
+            errors.append(f"{search_text}: {exc}")
+            continue
+
         for item in items:
             if not isinstance(item, dict):
+                continue
+
+            if not pds_item_matches_targets(item, targets):
                 continue
 
             if not pds_selected_raw_item(
@@ -1149,93 +1224,11 @@ def fetch_pds(
                 continue
 
             seen_raw.add(raw_id)
-            raw_items.append(item)
+            retained_raw.append(item)
 
-    def run_archive_query(search_text: str, limit: int = 250):
-        nonlocal successful_calls
-        try:
-            add_items(
-                pds_archive_search(
-                    search_text,
-                    rows=limit,
-                )
-            )
-            successful_calls += 1
-        except Exception as exc:
-            errors.append(f"{search_text}: {exc}")
-
-    # --------------------------------------------------------
-    # 1) TARGET-AWARE HIGH-LEVEL RETRIEVAL
-    # --------------------------------------------------------
-    # Use separate class queries instead of one complicated Boolean clause.
-    # The PDS archive search explicitly supports target: and product-class:.
-    for target in targets:
-        if include_data:
-            run_archive_query(
-                f'target:{target} AND product-class:Product_Collection',
-                300,
-            )
-            run_archive_query(
-                f'target:{target} AND product-class:Product_Bundle',
-                200,
-            )
-            run_archive_query(
-                f'target:{target} AND product-class:Product_Data_Set_PDS3',
-                300,
-            )
-
-        if include_documents:
-            # Standalone Product_Document records.
-            run_archive_query(
-                f'target:{target} AND product-class:Product_Document',
-                250,
-            )
-            # Document collections are Product_Collection records, so this
-            # query is intentionally repeated when documentation is selected;
-            # local filtering keeps only Document collections as appropriate.
-            run_archive_query(
-                f'target:{target} AND product-class:Product_Collection',
-                300,
-            )
-
-        # Science concept + target searches are especially important for a
-        # question such as "methane on Titan".  These queries let PDS do an
-        # initial lexical narrowing while INDUS performs the final semantics.
-        for concept in concepts:
-            run_archive_query(
-                f'target:{target} AND {concept}',
-                300,
-            )
-
-    # --------------------------------------------------------
-    # 2) TEXT FALLBACK / CONCEPT DISCOVERY
-    # --------------------------------------------------------
-    # If there is no recognized target, use the science concepts and the full
-    # question as broad archive searches.  Even with a target, a concept-only
-    # search can recover records whose target metadata is incomplete.
-    fallback_terms = []
-
-    if query.strip():
-        fallback_terms.append(query.strip())
-
-    fallback_terms.extend(concepts)
-
-    if not targets:
-        fallback_terms.extend(informative_terms(query, max_terms=6))
-
-    fallback_terms = list(
-        dict.fromkeys(term for term in fallback_terms if term)
-    )
-
-    for term in fallback_terms[:6]:
-        run_archive_query(term, 300)
-
-    # --------------------------------------------------------
-    # 3) PARSE + CLEAN
-    # --------------------------------------------------------
     parsed = []
 
-    for item in raw_items:
+    for item in retained_raw:
         record = parse_pds_record(
             item,
             allow_documentation=include_documents,
@@ -1248,15 +1241,16 @@ def fetch_pds(
     st.session_state["pds_diagnostics"] = {
         "targets": targets,
         "concepts": concepts,
-        "raw_count": len(raw_items),
+        "raw_api_hits": raw_api_hits,
+        "raw_count": len(retained_raw),
         "parsed_count": len(parsed),
         "successful_calls": successful_calls,
-        "fallback_calls": 0,
         "errors": errors,
         "backend": "PDS Data Set Keyword Search",
+        "search_terms": search_terms[:8],
     }
 
-    # INDUS performs the final cross-source ranking, so preserve a broad pool.
+    # INDUS performs the final ranking; preserve a broad but bounded pool.
     return parsed[: min(500, max(rows * 10, rows))]
 
 
@@ -1448,12 +1442,14 @@ if search_clicked:
 
                 diagnostics = st.session_state.get("pds_diagnostics", {})
                 targets = diagnostics.get("targets", [])
+                raw_api_hits = diagnostics.get("raw_api_hits", 0)
                 raw_count = diagnostics.get("raw_count", 0)
                 parsed_count = diagnostics.get("parsed_count", 0)
                 if targets:
                     st.write(
                         "PDS target-aware archive search: "
-                        f"{', '.join(targets)} · {raw_count} high-level candidates · "
+                        f"{', '.join(targets)} · {raw_api_hits} raw archive hits · "
+                        f"{raw_count} high-level target-matched candidates · "
                         f"{parsed_count} usable resources"
                     )
                 else:
