@@ -3,7 +3,7 @@ import math
 import re
 from datetime import datetime, timezone
 from typing import Dict, List
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import arxiv
 import numpy as np
@@ -393,6 +393,80 @@ def preferred_direct_file(file_urls: List[str]) -> str:
         if not url.lower().endswith(".xml"):
             return url
     return file_urls[0]
+
+
+def pds_parent_directory_url(url: str) -> str:
+    """
+    Convert a concrete PDS file URL into the directory that contains it.
+
+    Collection inventory tables are metadata that enumerate collection
+    members. They are not themselves the scientific data resource a user
+    expects to open. For aggregate PDS products, browsing the containing
+    archive directory is a much more useful access point.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+
+    parts = urlsplit(url)
+    path = parts.path or ""
+
+    if path.endswith("/"):
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+    if "/" not in path:
+        return ""
+
+    directory = path.rsplit("/", 1)[0] + "/"
+    return urlunsplit((parts.scheme, parts.netloc, directory, "", ""))
+
+
+def pds_archive_access_url(
+    product_class: str,
+    file_urls: List[str],
+    label_url: str,
+) -> str:
+    """
+    Choose the user-facing archive access link for a PDS result.
+
+    Documents may sensibly open a PDF directly. Bundles, collections, and data
+    sets should instead open an archive directory rather than a collection
+    inventory/member-list file.
+    """
+    if product_class == "Product_Document":
+        return preferred_direct_file(file_urls)
+
+    aggregate_classes = {
+        "Product_Bundle",
+        "Product_Collection",
+        "Product_Data_Set",
+        "Product_Data_Set_PDS3",
+    }
+
+    if product_class in aggregate_classes:
+        if label_url:
+            directory = pds_parent_directory_url(label_url)
+            if directory:
+                return directory
+
+        for url in file_urls:
+            directory = pds_parent_directory_url(url)
+            if directory:
+                return directory
+
+    return preferred_direct_file(file_urls)
+
+
+def pds_is_inventory_or_manifest_url(url: str) -> bool:
+    filename = urlsplit(url).path.rsplit("/", 1)[-1].lower()
+    return any(
+        token in filename
+        for token in (
+            "inventory",
+            "manifest",
+            "checksum",
+            "member",
+        )
+    )
 
 
 def get_pds_collection_type(item: dict) -> str:
@@ -864,8 +938,12 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
     )
 
     file_urls = get_pds_file_urls(item)
-    direct_file = preferred_direct_file(file_urls)
     label_url = get_pds_label_url(item)
+    access_url = pds_archive_access_url(
+        product_class,
+        file_urls,
+        label_url,
+    )
     human_url = pds_result_page(
         item,
         pds_human_page(product_class, lid, version),
@@ -885,7 +963,11 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
     if not description:
         return None
 
-    extra_file_urls = [url for url in file_urls if url != direct_file][:3]
+    extra_file_urls = [
+        url
+        for url in file_urls
+        if url != access_url and not pds_is_inventory_or_manifest_url(url)
+    ][:3]
 
     return {
         "title": title,
@@ -898,7 +980,7 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
         "record_id": record_id,
         "doi": doi,
         "url": human_url,
-        "secondary_url": direct_file,
+        "secondary_url": access_url,
         "label_url": label_url,
         "extra_file_urls": extra_file_urls,
         "pds_product_class": product_class,
@@ -1696,6 +1778,13 @@ if search_clicked:
                     direct_url = resource["secondary_url"]
                     if direct_url.lower().endswith(".pdf"):
                         links.append(f"[Open PDF]({direct_url})")
+                    elif resource.get("pds_product_class") in {
+                        "Product_Bundle",
+                        "Product_Collection",
+                        "Product_Data_Set",
+                        "Product_Data_Set_PDS3",
+                    }:
+                        links.append(f"[Browse archive files]({direct_url})")
                     else:
                         links.append(f"[Open data/resource]({direct_url})")
 
