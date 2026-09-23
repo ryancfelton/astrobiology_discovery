@@ -483,6 +483,7 @@ def lens_embeddings():
     )
 
 
+@st.cache_data(ttl=3600, max_entries=64, show_spinner=False)
 def rank_with_indus(
     resources: List[dict],
     query: str,
@@ -551,6 +552,7 @@ def rank_with_indus(
 # ============================================================
 
 
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def fetch_ads(
     query: str,
     api_key: str,
@@ -617,6 +619,7 @@ def fetch_ads(
 # ============================================================
 
 
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def fetch_arxiv(
     query: str,
     start_year: int,
@@ -673,6 +676,7 @@ def fetch_arxiv(
 # ============================================================
 
 
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def fetch_ntrs(
     query: str,
     start_year: int,
@@ -910,6 +914,7 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
 # ============================================================
 
 
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def pds_search_class(
     class_name: str,
     *,
@@ -949,6 +954,7 @@ def pds_search_class(
     return data if isinstance(data, list) else []
 
 
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def pds_search_products(
     *,
     q: str = "",
@@ -1057,6 +1063,7 @@ def pds_document_query(target: str = "") -> str:
     return f"({class_clause})"
 
 
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def pds_archive_search(
     query: str,
     *,
@@ -1122,6 +1129,77 @@ def pds_item_matches_targets(item: dict, targets: List[str]) -> bool:
     return any(re.search(rf"\b{re.escape(target.lower())}\b", fallback_text) for target in targets)
 
 
+def pds_prefilter_score(
+    resource: dict,
+    query: str,
+    targets: List[str],
+    concepts: List[str],
+) -> float:
+    """
+    Cheap lexical/metadata score used only to shrink a large PDS candidate pool
+    before the CPU-expensive INDUS embedding step.
+
+    This is NOT the final relevance score. INDUS performs the semantic ranking
+    after this prefilter. The goal is simply to avoid embedding hundreds of
+    obviously weaker PDS candidates on Streamlit Community Cloud.
+    """
+    title = clean_text(resource.get("title", "")).lower()
+    description = clean_text(resource.get("abstract", "")).lower()
+    context = clean_text(resource.get("metadata_context", "")).lower()
+
+    target_metadata = {
+        clean_text(value).lower()
+        for value in resource.get("pds_targets", [])
+        if clean_text(value)
+    }
+
+    score = 0.0
+
+    # Structured target metadata is the strongest cheap signal.
+    for target in targets:
+        target_lower = target.lower()
+        if target_lower in target_metadata:
+            score += 8.0
+        if target_lower in title:
+            score += 4.0
+        elif target_lower in description:
+            score += 2.0
+
+    # Science concepts such as methane should strongly favor resources whose
+    # titles/descriptions actually discuss the concept.
+    for concept in concepts:
+        concept_lower = concept.lower()
+        if concept_lower in title:
+            score += 6.0
+        if concept_lower in description:
+            score += 3.0
+        if concept_lower in context:
+            score += 1.0
+
+    # Include remaining informative query terms as weaker tie-breakers.
+    for term in informative_terms(query, max_terms=12):
+        term_lower = term.lower()
+        if any(term_lower == concept.lower() for concept in concepts):
+            continue
+        if any(term_lower in target.lower().split() for target in targets):
+            continue
+        if term_lower in title:
+            score += 2.0
+        elif term_lower in description:
+            score += 1.0
+
+    # Small preference for records with substantive descriptions and useful
+    # landing/direct-resource links.
+    if len(description) >= 120:
+        score += 0.5
+    if resource.get("url"):
+        score += 0.25
+    if resource.get("secondary_url"):
+        score += 0.25
+
+    return score
+
+
 def fetch_pds(
     query: str,
     rows: int,
@@ -1182,11 +1260,13 @@ def fetch_pds(
     errors = []
     successful_calls = 0
 
-    for search_text in search_terms[:8]:
+    raw_rows_per_query = min(300, max(120, rows * 5))
+
+    for search_text in search_terms[:6]:
         try:
-            # A target like Titan has only a few hundred high-level archive
-            # records, so a 500-record window is intentionally broad here.
-            items = pds_archive_search(search_text, rows=500)
+            # PDS is intentionally over-fetched relative to the UI search depth,
+            # but the pool is cheaply filtered before anything is sent to INDUS.
+            items = pds_archive_search(search_text, rows=raw_rows_per_query)
             successful_calls += 1
             raw_api_hits += len(items)
         except Exception as exc:
@@ -1238,20 +1318,36 @@ def fetch_pds(
 
     parsed = deduplicate_resources(parsed)
 
+    # Cheaply narrow the PDS pool before the expensive embedding step. The UI
+    # search-depth value now approximately means how many PDS resources INDUS
+    # will actually consider, matching the behavior of the other sources.
+    parsed.sort(
+        key=lambda resource: pds_prefilter_score(
+            resource,
+            query,
+            targets,
+            concepts,
+        ),
+        reverse=True,
+    )
+
+    usable_count = len(parsed)
+    indus_candidates = parsed[:rows]
+
     st.session_state["pds_diagnostics"] = {
         "targets": targets,
         "concepts": concepts,
         "raw_api_hits": raw_api_hits,
         "raw_count": len(retained_raw),
-        "parsed_count": len(parsed),
+        "parsed_count": usable_count,
+        "indus_count": len(indus_candidates),
         "successful_calls": successful_calls,
         "errors": errors,
         "backend": "PDS Data Set Keyword Search",
-        "search_terms": search_terms[:8],
+        "search_terms": search_terms[:6],
     }
 
-    # INDUS performs the final ranking; preserve a broad but bounded pool.
-    return parsed[: min(500, max(rows * 10, rows))]
+    return indus_candidates
 
 
 # ============================================================
@@ -1306,16 +1402,15 @@ with st.sidebar:
         40,
         step=10,
         help=(
-            "Controls how broadly each source is searched before INDUS reranks the "
-            "combined candidate pool. For ADS/SciX, arXiv, and NTRS this is roughly "
-            "the number of records requested from that source. PDS may retrieve a "
-            "larger internal pool so that useful bundles and collections are not "
-            "lost before semantic ranking."
+            "Controls approximately how many candidates from each selected source "
+            "are sent to INDUS for semantic ranking. PDS may retrieve a larger raw "
+            "pool internally, but it uses a cheap metadata/text prefilter so only "
+            "about this many PDS resources reach the CPU-expensive embedding step."
         ),
     )
     st.caption(
-        "Search depth controls how much material INDUS gets to consider. "
-        "It does not control how many final results are displayed."
+        "Search depth controls roughly how many candidates per source INDUS "
+        "embeds and ranks. It does not control how many final results are displayed."
     )
     results_to_show = st.slider(
         "Results to show",
@@ -1456,17 +1551,20 @@ if search_clicked:
                 raw_api_hits = diagnostics.get("raw_api_hits", 0)
                 raw_count = diagnostics.get("raw_count", 0)
                 parsed_count = diagnostics.get("parsed_count", 0)
+                indus_count = diagnostics.get("indus_count", 0)
                 if targets:
                     st.write(
                         "PDS target-aware archive search: "
                         f"{', '.join(targets)} · {raw_api_hits} raw archive hits · "
                         f"{raw_count} high-level target-matched candidates · "
-                        f"{parsed_count} usable resources"
+                        f"{parsed_count} usable resources · "
+                        f"{indus_count} sent to INDUS"
                     )
                 else:
                     st.write(
                         f"PDS archive text discovery: {raw_count} candidates · "
-                        f"{parsed_count} usable resources"
+                        f"{parsed_count} usable resources · "
+                        f"{indus_count} sent to INDUS"
                     )
             except Exception as exc:
                 errors.append(f"NASA PDS: {exc}")
