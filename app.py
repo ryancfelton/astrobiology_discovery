@@ -25,6 +25,7 @@ st.set_page_config(
 MODEL_NAME = "nasa-impact/indus-sde-st-v0.2"
 MODEL_URL = "https://huggingface.co/nasa-impact/indus-sde-st-v0.2"
 PDS_API_BASE = "https://pds.nasa.gov/api/search/1"
+PDS_ARCHIVE_SEARCH_ENDPOINT = "https://pds.nasa.gov/services/search/search"
 CURRENT_YEAR = datetime.now(timezone.utc).year
 
 
@@ -310,8 +311,9 @@ def is_useless_pds_description(text: str) -> bool:
 
 def get_pds_description(item: dict) -> str:
     priority_groups = [
-        ["pds:Citation_Information.pds:description"],
+        ["pds:Citation_Information.pds:description", "citation_description"],
         ["pds:Document.pds:description"],
+        ["abstract_text", "data_set_description"],
         ["bundle_description", "collection_description"],
         ["description"],
     ]
@@ -343,6 +345,17 @@ def pds_human_page(product_class: str, lid: str, version: str) -> str:
         return base + "viewDocument.jsp?identifier=" + identifier + version_piece
 
     return "https://pds.nasa.gov/services/search/search?q=" + identifier
+
+
+def pds_result_page(item: dict, fallback_url: str) -> str:
+    """Prefer the human-facing result URL returned by the PDS archive search."""
+    result_url = pds_first(item, ["resLocation", "res_location"])
+    if result_url:
+        if result_url.startswith(("http://", "https://")):
+            return result_url
+        if result_url.startswith("/"):
+            return "https://pds.nasa.gov" + result_url
+    return fallback_url
 
 
 def get_pds_file_urls(item: dict) -> List[str]:
@@ -819,6 +832,7 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
             "pds:Citation_Information.pds:author_list",
             "pds:Document.pds:author_list",
             "citation_author_list",
+            "full_name",
         ],
     )
 
@@ -829,6 +843,7 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
             "pds:Document.pds:publication_date",
             "citation_publication_year",
             "publication_year",
+            "data_set_release_date",
         ],
     )
     year_match = re.search(r"\b(?:19|20)\d{2}\b", year_text)
@@ -847,7 +862,10 @@ def parse_pds_record(item: dict, allow_documentation: bool = False):
     file_urls = get_pds_file_urls(item)
     direct_file = preferred_direct_file(file_urls)
     label_url = get_pds_label_url(item)
-    human_url = pds_human_page(product_class, lid, version)
+    human_url = pds_result_page(
+        item,
+        pds_human_page(product_class, lid, version),
+    )
 
     context_parts = []
     if targets:
@@ -1039,6 +1057,40 @@ def pds_document_query(target: str = "") -> str:
     return f"({class_clause})"
 
 
+def pds_archive_search(
+    query: str,
+    *,
+    rows: int = 250,
+    start: int = 0,
+) -> List[dict]:
+    """
+    Search the PDS archive's higher-level Data Set Keyword Search service.
+
+    This service exposes the archive records scientists actually browse and
+    supports fields such as target:, product-class:, investigation:, and
+    instrument:.  It has proven much more reliable for bundle/collection/data
+    set discovery than the beta Search API endpoints used in earlier versions
+    of this prototype.
+    """
+    params = {
+        "q": query,
+        "rows": min(max(rows, 1), 500),
+        "start": max(start, 0),
+    }
+
+    response = requests.get(
+        PDS_ARCHIVE_SEARCH_ENDPOINT,
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    docs = payload.get("response", {}).get("docs", [])
+    return docs if isinstance(docs, list) else []
+
+
 def fetch_pds(
     query: str,
     rows: int,
@@ -1046,19 +1098,16 @@ def fetch_pds(
     include_documents: bool,
 ) -> List[dict]:
     """
-    Build a broad PDS candidate pool before INDUS reranking.
+    Build a high-level PDS candidate pool using the archive's Data Set Keyword
+    Search service, then let INDUS-SDE-ST perform semantic reranking.
 
-    Retrieval strategy:
-      1. Recognize explicit planetary targets in the user's question.
-      2. Query bundles/collections by structured target metadata.
-      3. Query Product_Document through /products rather than the less reliable
-         dedicated documents endpoint.
-      4. Always run broad /products keyword fallbacks for the target and science
-         concepts, with a much larger result limit than the old implementation.
-      5. Filter to high-level resources locally, then let INDUS rank relevance.
-
-    This deliberately favors robust candidate generation over trusting a single
-    PDS endpoint or a shallow first page of mixed products.
+    Strategy:
+      1. Detect explicit planetary targets (Titan, Europa, Mars, etc.).
+      2. Retrieve high-level records by target and product class.
+      3. Run target + science-concept searches (e.g. target:Titan AND methane).
+      4. Run a general text fallback for queries without a recognized target.
+      5. Locally reject context/schema/infrastructure records and retain only
+         the resource types selected by the user.
     """
     if not include_data and not include_documents:
         return []
@@ -1070,27 +1119,10 @@ def fetch_pds(
     seen_raw = set()
     errors = []
     successful_calls = 0
-    fallback_calls = 0
 
     def add_items(items):
         for item in items:
             if not isinstance(item, dict):
-                continue
-
-            raw_id = clean_text(
-                str(
-                    item.get("id")
-                    or item.get("lidvid")
-                    or item.get("lid")
-                    or item.get("title")
-                    or ""
-                )
-            )
-
-            if not raw_id:
-                raw_id = str(hash(str(item)))
-
-            if raw_id in seen_raw:
                 continue
 
             if not pds_selected_raw_item(
@@ -1100,112 +1132,107 @@ def fetch_pds(
             ):
                 continue
 
+            raw_id = clean_text(
+                str(
+                    item.get("lidvid")
+                    or item.get("lid")
+                    or item.get("identifier")
+                    or item.get("title")
+                    or ""
+                )
+            )
+
+            if not raw_id:
+                continue
+
+            if raw_id in seen_raw:
+                continue
+
             seen_raw.add(raw_id)
             raw_items.append(item)
 
-    # --------------------------------------------------------
-    # 1) STRUCTURED TARGET SEARCHES
-    # --------------------------------------------------------
-    # Parentheses are intentional: PDS documents grouped query syntax and the
-    # live parser has been more reliable with explicit grouping.
-    for target in targets:
-        target_q = f'(target_name eq "{target}")'
+    def run_archive_query(search_text: str, limit: int = 250):
+        nonlocal successful_calls
+        try:
+            add_items(
+                pds_archive_search(
+                    search_text,
+                    rows=limit,
+                )
+            )
+            successful_calls += 1
+        except Exception as exc:
+            errors.append(f"{search_text}: {exc}")
 
+    # --------------------------------------------------------
+    # 1) TARGET-AWARE HIGH-LEVEL RETRIEVAL
+    # --------------------------------------------------------
+    # Use separate class queries instead of one complicated Boolean clause.
+    # The PDS archive search explicitly supports target: and product-class:.
+    for target in targets:
         if include_data:
-            for class_name in ["bundles", "collections"]:
-                try:
-                    add_items(
-                        pds_search_class(
-                            class_name,
-                            q=target_q,
-                            limit=250,
-                        )
-                    )
-                    successful_calls += 1
-                except Exception as exc:
-                    errors.append(
-                        f"{class_name} structured target={target}: {exc}"
-                    )
+            run_archive_query(
+                f'target:{target} AND product-class:Product_Collection',
+                300,
+            )
+            run_archive_query(
+                f'target:{target} AND product-class:Product_Bundle',
+                200,
+            )
+            run_archive_query(
+                f'target:{target} AND product-class:Product_Data_Set_PDS3',
+                300,
+            )
 
         if include_documents:
-            try:
-                add_items(
-                    pds_search_products(
-                        q=pds_document_query(target),
-                        limit=250,
-                    )
-                )
-                successful_calls += 1
-            except Exception as exc:
-                errors.append(
-                    f"documents structured target={target}: {exc}"
-                )
-
-    # --------------------------------------------------------
-    # 2) HIGH-LIMIT TARGET KEYWORD FALLBACK
-    # --------------------------------------------------------
-    # This is important. Even when structured metadata calls fail or PDS has
-    # incomplete target indexing, a broad keyword call for "Titan", "Europa",
-    # etc. can still expose bundles, collections, and documents whose titles or
-    # descriptions mention that world.
-    for target in targets:
-        try:
-            add_items(
-                pds_search_products(
-                    keywords=target,
-                    limit=750,
-                )
+            # Standalone Product_Document records.
+            run_archive_query(
+                f'target:{target} AND product-class:Product_Document',
+                250,
             )
-            successful_calls += 1
-            fallback_calls += 1
-        except Exception as exc:
-            errors.append(
-                f"products keyword target={target}: {exc}"
+            # Document collections are Product_Collection records, so this
+            # query is intentionally repeated when documentation is selected;
+            # local filtering keeps only Document collections as appropriate.
+            run_archive_query(
+                f'target:{target} AND product-class:Product_Collection',
+                300,
+            )
+
+        # Science concept + target searches are especially important for a
+        # question such as "methane on Titan".  These queries let PDS do an
+        # initial lexical narrowing while INDUS performs the final semantics.
+        for concept in concepts:
+            run_archive_query(
+                f'target:{target} AND {concept}',
+                300,
             )
 
     # --------------------------------------------------------
-    # 3) SCIENCE-CONCEPT KEYWORD DISCOVERY
+    # 2) TEXT FALLBACK / CONCEPT DISCOVERY
     # --------------------------------------------------------
-    # Search full question plus a few useful concepts. We use /products here
-    # because it is the broadest and most stable PDS discovery path, then
-    # locally keep only the selected high-level resource types.
-    keyword_queries = []
+    # If there is no recognized target, use the science concepts and the full
+    # question as broad archive searches.  Even with a target, a concept-only
+    # search can recover records whose target metadata is incomplete.
+    fallback_terms = []
 
     if query.strip():
-        keyword_queries.append(query.strip())
+        fallback_terms.append(query.strip())
 
-    keyword_queries.extend(concepts)
+    fallback_terms.extend(concepts)
 
     if not targets:
-        keyword_queries.extend(informative_terms(query, max_terms=6))
+        fallback_terms.extend(informative_terms(query, max_terms=6))
 
-    keyword_queries = list(
-        dict.fromkeys([term for term in keyword_queries if term])
+    fallback_terms = list(
+        dict.fromkeys(term for term in fallback_terms if term)
     )
 
-    for keyword in keyword_queries[:6]:
-        try:
-            add_items(
-                pds_search_products(
-                    keywords=keyword,
-                    limit=500,
-                )
-            )
-            successful_calls += 1
-            fallback_calls += 1
-        except Exception as exc:
-            errors.append(
-                f"products keyword={keyword}: {exc}"
-            )
+    for term in fallback_terms[:6]:
+        run_archive_query(term, 300)
 
     # --------------------------------------------------------
-    # 4) DOCUMENT COVERAGE
+    # 3) PARSE + CLEAN
     # --------------------------------------------------------
-    # Documentation is already captured by the high-limit /products keyword
-    # fallbacks above. We intentionally avoid extra Product_Document + keyword
-    # compound queries here because that route has been inconsistent on the
-    # live PDS service.
-
     parsed = []
 
     for item in raw_items:
@@ -1213,7 +1240,6 @@ def fetch_pds(
             item,
             allow_documentation=include_documents,
         )
-
         if record:
             parsed.append(record)
 
@@ -1225,12 +1251,12 @@ def fetch_pds(
         "raw_count": len(raw_items),
         "parsed_count": len(parsed),
         "successful_calls": successful_calls,
-        "fallback_calls": fallback_calls,
+        "fallback_calls": 0,
         "errors": errors,
+        "backend": "PDS Data Set Keyword Search",
     }
 
-    # Give INDUS a genuinely broad PDS candidate pool. The UI still shows only
-    # results_to_show after all sources have been reranked together.
+    # INDUS performs the final cross-source ranking, so preserve a broad pool.
     return parsed[: min(500, max(rows * 10, rows))]
 
 
@@ -1409,7 +1435,7 @@ if search_clicked:
                 errors.append(f"NASA NTRS: {exc}")
 
         if source_pds_data or source_pds_docs:
-            st.write("Searching NASA PDS with structured target and product-class retrieval...")
+            st.write("Searching NASA PDS archive datasets and collections...")
             try:
                 pds_results = fetch_pds(
                     query,
@@ -1426,14 +1452,14 @@ if search_clicked:
                 parsed_count = diagnostics.get("parsed_count", 0)
                 if targets:
                     st.write(
-                        "PDS structured target search: "
-                        f"{', '.join(targets)} · {raw_count} raw candidates · "
-                        f"{parsed_count} usable high-level resources"
+                        "PDS target-aware archive search: "
+                        f"{', '.join(targets)} · {raw_count} high-level candidates · "
+                        f"{parsed_count} usable resources"
                     )
                 else:
                     st.write(
-                        f"PDS text discovery: {raw_count} raw candidates · "
-                        f"{parsed_count} usable high-level resources"
+                        f"PDS archive text discovery: {raw_count} candidates · "
+                        f"{parsed_count} usable resources"
                     )
             except Exception as exc:
                 errors.append(f"NASA PDS: {exc}")
