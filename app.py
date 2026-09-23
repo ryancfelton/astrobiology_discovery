@@ -1300,11 +1300,22 @@ with st.sidebar:
     )
 
     candidates_per_source = st.slider(
-        "Candidates per source",
+        "Candidate search depth",
         10,
         100,
         40,
         step=10,
+        help=(
+            "Controls how broadly each source is searched before INDUS reranks the "
+            "combined candidate pool. For ADS/SciX, arXiv, and NTRS this is roughly "
+            "the number of records requested from that source. PDS may retrieve a "
+            "larger internal pool so that useful bundles and collections are not "
+            "lost before semantic ranking."
+        ),
+    )
+    st.caption(
+        "Search depth controls how much material INDUS gets to consider. "
+        "It does not control how many final results are displayed."
     )
     results_to_show = st.slider(
         "Results to show",
