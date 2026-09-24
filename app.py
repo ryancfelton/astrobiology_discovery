@@ -1,6 +1,8 @@
 import html
 import math
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, List
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -1590,50 +1592,69 @@ if search_clicked:
     resources: List[dict] = []
     errors = []
     source_counts = {}
+    search_started = time.perf_counter()
 
     with st.status("Gathering candidate science...", expanded=True) as status:
+        # ADS/SciX, arXiv, and NTRS are independent network calls. Run them in
+        # parallel so one slow service does not block the other sources.
+        source_jobs = {}
+
         if source_ads and ads_api_key:
             st.write("Searching ADS/SciX publications...")
-            try:
-                ads_results = fetch_ads(
+        if source_arxiv:
+            st.write("Searching arXiv preprints...")
+        if source_ntrs:
+            st.write("Searching NASA NTRS technical material...")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            if source_ads and ads_api_key:
+                started = time.perf_counter()
+                future = executor.submit(
+                    fetch_ads,
                     query,
                     ads_api_key,
                     year_range[0],
                     year_range[1],
                     candidates_per_source,
                 )
-                resources.extend(ads_results)
-                source_counts["ADS/SciX"] = len(ads_results)
-            except Exception as exc:
-                errors.append(f"ADS/SciX: {exc}")
+                source_jobs[future] = ("ADS/SciX", started)
 
-        if source_arxiv:
-            st.write("Searching arXiv preprints...")
-            try:
-                arxiv_results = fetch_arxiv(
+            if source_arxiv:
+                started = time.perf_counter()
+                future = executor.submit(
+                    fetch_arxiv,
                     query,
                     year_range[0],
                     year_range[1],
                     candidates_per_source,
                 )
-                resources.extend(arxiv_results)
-                source_counts["arXiv"] = len(arxiv_results)
-            except Exception as exc:
-                errors.append(f"arXiv: {exc}")
+                source_jobs[future] = ("arXiv", started)
 
-        if source_ntrs:
-            st.write("Searching NASA NTRS technical material...")
-            try:
-                ntrs_results = fetch_ntrs(
+            if source_ntrs:
+                started = time.perf_counter()
+                future = executor.submit(
+                    fetch_ntrs,
                     query,
                     year_range[0],
                     year_range[1],
                     candidates_per_source,
                 )
-                resources.extend(ntrs_results)
-                source_counts["NASA NTRS"] = len(ntrs_results)
-            except Exception as exc:
-                errors.append(f"NASA NTRS: {exc}")
+                source_jobs[future] = ("NASA NTRS", started)
+
+            for future in as_completed(source_jobs):
+                source_name, started = source_jobs[future]
+                elapsed = time.perf_counter() - started
+                try:
+                    source_results = future.result()
+                    resources.extend(source_results)
+                    source_counts[source_name] = len(source_results)
+                    st.write(
+                        f"{source_name}: {len(source_results)} candidates "
+                        f"({elapsed:.1f}s)"
+                    )
+                except Exception as exc:
+                    errors.append(f"{source_name}: {exc}")
+                    st.write(f"{source_name}: request failed ({elapsed:.1f}s)")
 
         if PDS_ENABLED and (source_pds_data or source_pds_docs):
             st.write("Searching NASA PDS archive datasets and collections...")
@@ -1671,6 +1692,8 @@ if search_clicked:
                 errors.append(f"NASA PDS: {exc}")
 
         resources = deduplicate_resources(resources)
+        retrieval_elapsed = time.perf_counter() - search_started
+        st.write(f"Source retrieval completed in {retrieval_elapsed:.1f}s.")
 
         if source_counts:
             count_text = " · ".join(
@@ -1693,11 +1716,14 @@ if search_clicked:
                     "by semantic similarity to your question..."
                 )
 
+            ranking_started = time.perf_counter()
             ranked = rank_with_indus(
                 resources,
                 query,
                 use_astro_lens=use_astro_lens,
             )
+            ranking_elapsed = time.perf_counter() - ranking_started
+            st.write(f"INDUS ranking completed in {ranking_elapsed:.1f}s.")
         else:
             ranked = []
 
