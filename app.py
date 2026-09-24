@@ -785,7 +785,7 @@ def fetch_ads(
                 "year": int(doc.get("year") or 0),
                 "abstract": abstract,
                 "metadata_context": "",
-                "source": "ADS/SciX",
+                "source": "ADS",
                 "resource_type": "Publication",
                 "record_id": bibcode,
                 "doi": doi,
@@ -1601,7 +1601,7 @@ with st.sidebar:
 
     st.markdown("**Literature & Technical Sources**")
     source_ads = st.checkbox(
-        "ADS / SciX",
+        "ADS",
         key="source_ads",
         on_change=sync_select_all_sources,
     )
@@ -1654,7 +1654,7 @@ with st.sidebar:
         value=(2015, CURRENT_YEAR),
     )
     st.caption(
-        "Publication years apply to ADS/SciX, arXiv, and NTRS. "
+        "Publication years apply to ADS, arXiv, and NTRS. "
         "PDS archive resources are searched independently of this filter."
     )
 
@@ -1733,7 +1733,7 @@ if search_clicked:
     ads_api_key = st.secrets.get("ADS_API_KEY", "")
     if source_ads and not ads_api_key:
         st.info(
-            "ADS/SciX is enabled, but no `ADS_API_KEY` is configured in Streamlit Secrets. "
+            "ADS is enabled, but no `ADS_API_KEY` is configured in Streamlit Secrets. "
             "This search will continue with the other selected sources."
         )
 
@@ -1755,12 +1755,12 @@ if search_clicked:
     search_started = time.perf_counter()
 
     with st.status("Gathering candidate science...", expanded=True) as status:
-        # ADS/SciX, arXiv, and NTRS are independent network calls. Run them in
+        # ADS, arXiv, and NTRS are independent network calls. Run them in
         # parallel so one slow service does not block the other sources.
         source_jobs = {}
 
         if source_ads and ads_api_key:
-            st.write("Searching ADS/SciX publications...")
+            st.write("Searching ADS publications...")
         if source_arxiv:
             st.write("Searching arXiv preprints...")
         if source_ntrs:
@@ -1777,7 +1777,7 @@ if search_clicked:
                     year_range[1],
                     candidates_per_source,
                 )
-                source_jobs[future] = ("ADS/SciX", started)
+                source_jobs[future] = ("ADS", started)
 
             if source_arxiv:
                 started = time.perf_counter()
