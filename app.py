@@ -11,6 +11,7 @@ import arxiv
 import numpy as np
 import requests
 import streamlit as st
+import torch
 from sentence_transformers import SentenceTransformer
 
 
@@ -551,7 +552,19 @@ def pds_resource_type(product_class: str, collection_type: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_indus_model():
-    return SentenceTransformer(MODEL_NAME, device="cpu")
+    # Explicitly keep CPU inference in FP32. Newer Transformers versions may
+    # honor the checkpoint's configured BF16 dtype automatically, which can be
+    # extremely slow on CPUs without fast native BF16 support.
+    model = SentenceTransformer(MODEL_NAME, device="cpu")
+    model = model.float()
+    return model
+
+
+def indus_model_dtype(model) -> str:
+    try:
+        return str(next(model.parameters()).dtype)
+    except (StopIteration, AttributeError):
+        return "unknown"
 
 
 @st.cache_resource(show_spinner=False)
@@ -570,20 +583,29 @@ def rank_with_indus(
     resources: List[dict],
     query: str,
     use_astro_lens: bool = False,
-) -> List[dict]:
+):
     if not resources:
-        return []
+        return [], {}
 
+    diagnostics = {}
+
+    model_load_started = time.perf_counter()
     model = load_indus_model()
+    diagnostics["model_load_seconds"] = time.perf_counter() - model_load_started
+    diagnostics["model_dtype"] = indus_model_dtype(model)
+
     texts = [resource_text(resource) for resource in resources]
 
+    query_started = time.perf_counter()
     query_embedding = model.encode(
         [query],
         normalize_embeddings=True,
         convert_to_numpy=True,
         show_progress_bar=False,
     )[0]
+    diagnostics["query_embedding_seconds"] = time.perf_counter() - query_started
 
+    docs_started = time.perf_counter()
     doc_embeddings = model.encode(
         texts,
         batch_size=12,
@@ -591,8 +613,12 @@ def rank_with_indus(
         convert_to_numpy=True,
         show_progress_bar=False,
     )
+    diagnostics["document_embedding_seconds"] = time.perf_counter() - docs_started
+    diagnostics["document_count"] = len(texts)
 
+    scoring_started = time.perf_counter()
     query_scores = doc_embeddings @ query_embedding
+    diagnostics["cosine_scoring_seconds"] = time.perf_counter() - scoring_started
 
     if not use_astro_lens:
         ranked = []
@@ -604,10 +630,13 @@ def rank_with_indus(
             item["astro_tags"] = []
             ranked.append(item)
         ranked.sort(key=lambda r: r["combined_score"], reverse=True)
-        return ranked
+        return ranked, diagnostics
 
+    lens_started = time.perf_counter()
     lens_emb = lens_embeddings()
     all_lens_scores = doc_embeddings @ lens_emb.T
+    diagnostics["astro_lens_seconds"] = time.perf_counter() - lens_started
+
     astro_scores = np.max(all_lens_scores, axis=1)
     combined_scores = (
         (1.0 - ASTRO_LENS_WEIGHT) * query_scores
@@ -626,7 +655,7 @@ def rank_with_indus(
         ranked.append(item)
 
     ranked.sort(key=lambda r: r["combined_score"], reverse=True)
-    return ranked
+    return ranked, diagnostics
 
 
 # ============================================================
@@ -1717,13 +1746,29 @@ if search_clicked:
                 )
 
             ranking_started = time.perf_counter()
-            ranked = rank_with_indus(
+            ranked, indus_diagnostics = rank_with_indus(
                 resources,
                 query,
                 use_astro_lens=use_astro_lens,
             )
             ranking_elapsed = time.perf_counter() - ranking_started
             st.write(f"INDUS ranking completed in {ranking_elapsed:.1f}s.")
+
+            if indus_diagnostics:
+                st.write(
+                    "INDUS diagnostics: "
+                    f"model load/cache {indus_diagnostics.get('model_load_seconds', 0.0):.2f}s · "
+                    f"query embedding {indus_diagnostics.get('query_embedding_seconds', 0.0):.2f}s · "
+                    f"{indus_diagnostics.get('document_count', len(resources))} document embeddings "
+                    f"{indus_diagnostics.get('document_embedding_seconds', 0.0):.2f}s · "
+                    f"cosine scoring {indus_diagnostics.get('cosine_scoring_seconds', 0.0):.4f}s · "
+                    f"dtype {indus_diagnostics.get('model_dtype', 'unknown')}"
+                )
+                if use_astro_lens:
+                    st.write(
+                        "Astrobiology Lens embedding/scoring: "
+                        f"{indus_diagnostics.get('astro_lens_seconds', 0.0):.2f}s."
+                    )
         else:
             ranked = []
 
