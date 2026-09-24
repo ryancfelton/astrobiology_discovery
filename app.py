@@ -1490,7 +1490,7 @@ with st.sidebar:
     st.markdown("**Planetary Data System**")
     source_pds_data = st.checkbox(
         "PDS datasets / collections",
-        value=False,
+        value=True,
         disabled=not PDS_ENABLED,
         help=(
             "Temporarily disabled to reduce Streamlit compute usage. The PDS "
