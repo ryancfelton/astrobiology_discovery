@@ -1,3 +1,4 @@
+import hashlib
 import html
 import math
 import re
@@ -216,11 +217,41 @@ def deduplicate_resources(resources: List[dict]) -> List[dict]:
     return unique
 
 
+def resource_sort_key(resource: dict):
+    """Stable ordering so equivalent candidate sets produce identical cache keys."""
+    return (
+        clean_text(str(resource.get("source", ""))).lower(),
+        clean_text(str(resource.get("record_id", ""))).lower(),
+        clean_text(str(resource.get("doi", ""))).lower(),
+        clean_text(str(resource.get("title", ""))).lower(),
+        int(resource.get("year") or 0),
+    )
+
+
 def resource_text(resource: dict) -> str:
     title = resource.get("title", "")
     description = resource.get("abstract", "")
     context = resource.get("metadata_context", "")
     return f"{title}. {description}. {context}".strip()
+
+
+def resource_embedding_key(resource: dict, text: str) -> str:
+    """
+    Stable cache key for an INDUS document embedding.
+
+    Including both the record identity and actual text means an updated
+    abstract/metadata record automatically gets a fresh embedding.
+    """
+    identity = "|".join(
+        [
+            MODEL_NAME,
+            clean_text(str(resource.get("source", ""))),
+            clean_text(str(resource.get("record_id", ""))),
+            clean_text(str(resource.get("doi", ""))),
+            text,
+        ]
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def strength_label(score: float, values: np.ndarray) -> str:
@@ -568,6 +599,19 @@ def indus_model_dtype(model) -> str:
 
 
 @st.cache_resource(show_spinner=False)
+def resource_embedding_cache():
+    # Shared within the life of this Streamlit process. This avoids recomputing
+    # INDUS embeddings for the same papers/resources across related searches.
+    return {}
+
+
+def trim_resource_embedding_cache(cache: dict, max_entries: int = 5000):
+    while len(cache) > max_entries:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
+
+
+@st.cache_resource(show_spinner=False)
 def lens_embeddings():
     model = load_indus_model()
     return model.encode(
@@ -595,6 +639,10 @@ def rank_with_indus(
     diagnostics["model_dtype"] = indus_model_dtype(model)
 
     texts = [resource_text(resource) for resource in resources]
+    embedding_keys = [
+        resource_embedding_key(resource, text)
+        for resource, text in zip(resources, texts)
+    ]
 
     query_started = time.perf_counter()
     query_embedding = model.encode(
@@ -606,15 +654,39 @@ def rank_with_indus(
     diagnostics["query_embedding_seconds"] = time.perf_counter() - query_started
 
     docs_started = time.perf_counter()
-    doc_embeddings = model.encode(
-        texts,
-        batch_size=12,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
+    embedding_cache = resource_embedding_cache()
+
+    missing_indices = [
+        index
+        for index, key in enumerate(embedding_keys)
+        if key not in embedding_cache
+    ]
+
+    if missing_indices:
+        missing_texts = [texts[index] for index in missing_indices]
+        missing_embeddings = model.encode(
+            missing_texts,
+            batch_size=12,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+
+        for index, embedding in zip(missing_indices, missing_embeddings):
+            embedding_cache[embedding_keys[index]] = embedding
+
+        trim_resource_embedding_cache(embedding_cache)
+
+    doc_embeddings = np.stack(
+        [embedding_cache[key] for key in embedding_keys],
+        axis=0,
     )
+
     diagnostics["document_embedding_seconds"] = time.perf_counter() - docs_started
     diagnostics["document_count"] = len(texts)
+    diagnostics["document_cache_hits"] = len(texts) - len(missing_indices)
+    diagnostics["document_cache_misses"] = len(missing_indices)
+    diagnostics["document_cache_size"] = len(embedding_cache)
 
     scoring_started = time.perf_counter()
     query_scores = doc_embeddings @ query_embedding
@@ -1351,37 +1423,38 @@ def fetch_pds(
     targets = detect_pds_targets(query)
     concepts = pds_concept_terms(query, targets, max_terms=5)
 
-    # Build broad archive-search strings.  Do NOT use target: or product-class:
-    # here; the result metadata is more reliable than the fielded query parser.
+    # Build a small, prioritized set of lexical searches and stop as soon as
+    # enough plausible PDS candidates have been found. This avoids repeatedly
+    # hitting the archive for broad fallback searches when the first query was
+    # already sufficient.
     search_terms = []
 
-    for target in targets:
-        search_terms.append(target)
-        for concept in concepts:
-            search_terms.append(f"{concept} {target}")
+    if targets:
+        for target in targets:
+            if concepts:
+                search_terms.append(f"{concepts[0]} {target}")
+            search_terms.append(target)
+        if concepts:
+            search_terms.append(concepts[0])
+    else:
+        if query.strip():
+            search_terms.append(query.strip())
+        search_terms.extend(informative_terms(query, max_terms=2))
 
-    # Concept-only queries recover older PDS3 records whose target indexing can
-    # be incomplete or whose text is much more specific than the target query.
-    search_terms.extend(concepts)
-
-    # Full user wording is a final lexical fallback.
-    if query.strip():
-        search_terms.append(query.strip())
-
-    if not search_terms:
-        search_terms.extend(informative_terms(query, max_terms=6))
-
-    search_terms = list(dict.fromkeys(term for term in search_terms if term))
+    search_terms = list(dict.fromkeys(term for term in search_terms if term))[:3]
 
     raw_api_hits = 0
     retained_raw = []
     seen_raw = set()
     errors = []
     successful_calls = 0
+    attempted_terms = []
 
-    raw_rows_per_query = min(300, max(120, rows * 5))
+    raw_rows_per_query = min(150, max(80, rows * 3))
+    target_pool_size = max(60, rows * 2)
 
-    for search_text in search_terms[:6]:
+    for search_text in search_terms:
+        attempted_terms.append(search_text)
         try:
             # PDS is intentionally over-fetched relative to the UI search depth,
             # but the pool is cheaply filtered before anything is sent to INDUS.
@@ -1425,6 +1498,11 @@ def fetch_pds(
             seen_raw.add(raw_id)
             retained_raw.append(item)
 
+        # Once the locally filtered pool is comfortably larger than the number
+        # that will reach INDUS, skip broader fallback queries.
+        if len(retained_raw) >= target_pool_size:
+            break
+
     parsed = []
 
     for item in retained_raw:
@@ -1463,7 +1541,7 @@ def fetch_pds(
         "successful_calls": successful_calls,
         "errors": errors,
         "backend": "PDS Data Set Keyword Search",
-        "search_terms": search_terms[:6],
+        "search_terms": attempted_terms,
     }
 
     return indus_candidates
@@ -1774,6 +1852,7 @@ if search_clicked:
                 errors.append(f"NASA PDS: {exc}")
 
         resources = deduplicate_resources(resources)
+        resources.sort(key=resource_sort_key)
         retrieval_elapsed = time.perf_counter() - search_started
         st.write(f"Source retrieval completed in {retrieval_elapsed:.1f}s.")
 
@@ -1814,6 +1893,8 @@ if search_clicked:
                     f"query embedding {indus_diagnostics.get('query_embedding_seconds', 0.0):.2f}s · "
                     f"{indus_diagnostics.get('document_count', len(resources))} document embeddings "
                     f"{indus_diagnostics.get('document_embedding_seconds', 0.0):.2f}s · "
+                    f"document cache {indus_diagnostics.get('document_cache_hits', 0)} hit / "
+                    f"{indus_diagnostics.get('document_cache_misses', 0)} new · "
                     f"cosine scoring {indus_diagnostics.get('cosine_scoring_seconds', 0.0):.4f}s · "
                     f"dtype {indus_diagnostics.get('model_dtype', 'unknown')}"
                 )
