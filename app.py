@@ -26,6 +26,12 @@ MODEL_NAME = "nasa-impact/indus-sde-st-v0.2"
 MODEL_URL = "https://huggingface.co/nasa-impact/indus-sde-st-v0.2"
 PDS_API_BASE = "https://pds.nasa.gov/api/search/1"
 PDS_ARCHIVE_SEARCH_ENDPOINT = "https://pds.nasa.gov/services/search/search"
+
+# Temporary feature flag. Keep all PDS retrieval/parsing code in place, but
+# disable the feature while Streamlit Community Cloud resource usage is being
+# evaluated. Set this back to True to restore PDS search.
+PDS_ENABLED = False
+
 CURRENT_YEAR = datetime.now(timezone.utc).year
 
 
@@ -1453,8 +1459,13 @@ with st.sidebar:
     st.markdown("**Planetary Data System**")
     source_pds_data = st.checkbox(
         "PDS datasets / collections",
-        value=True,
+        value=False,
+        disabled=not PDS_ENABLED,
         help=(
+            "Temporarily disabled to reduce Streamlit compute usage. The PDS "
+            "retrieval and parsing code remains in the app and can be re-enabled."
+            if not PDS_ENABLED
+            else
             "Search PDS bundles and data-like collections. Context registries, "
             "schema collections, miscellaneous infrastructure collections, and "
             "documentation are excluded from this option."
@@ -1463,8 +1474,16 @@ with st.sidebar:
     source_pds_docs = st.checkbox(
         "PDS documentation",
         value=False,
-        help="Also include PDS manuals, user guides, interface documents, and documentation products.",
+        disabled=not PDS_ENABLED,
+        help=(
+            "Temporarily disabled to reduce Streamlit compute usage."
+            if not PDS_ENABLED
+            else
+            "Also include PDS manuals, user guides, interface documents, and documentation products."
+        ),
     )
+    if not PDS_ENABLED:
+        st.caption("PDS search is temporarily disabled to conserve app compute.")
 
     year_range = st.slider(
         "Publication years",
@@ -1616,7 +1635,7 @@ if search_clicked:
             except Exception as exc:
                 errors.append(f"NASA NTRS: {exc}")
 
-        if source_pds_data or source_pds_docs:
+        if PDS_ENABLED and (source_pds_data or source_pds_docs):
             st.write("Searching NASA PDS archive datasets and collections...")
             try:
                 pds_results = fetch_pds(
