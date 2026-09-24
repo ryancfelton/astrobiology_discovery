@@ -1479,18 +1479,70 @@ st.caption(
     "technical resources using NASA-IMPACT's INDUS-SDE-ST model."
 )
 
+SOURCE_CHECKBOX_DEFAULTS = {
+    "source_ads": True,
+    "source_arxiv": True,
+    "source_ntrs": True,
+    "source_pds_data": True,
+    "source_pds_docs": False,
+}
+
+for source_key, default_value in SOURCE_CHECKBOX_DEFAULTS.items():
+    if source_key not in st.session_state:
+        st.session_state[source_key] = default_value
+
+if "source_select_all" not in st.session_state:
+    st.session_state["source_select_all"] = all(
+        st.session_state[source_key]
+        for source_key in SOURCE_CHECKBOX_DEFAULTS
+    )
+
+
+def toggle_all_sources():
+    selected = st.session_state["source_select_all"]
+    for source_key in SOURCE_CHECKBOX_DEFAULTS:
+        st.session_state[source_key] = selected
+
+
+def sync_select_all_sources():
+    st.session_state["source_select_all"] = all(
+        st.session_state[source_key]
+        for source_key in SOURCE_CHECKBOX_DEFAULTS
+    )
+
+
 with st.sidebar:
     st.header("Discovery settings")
 
+    st.checkbox(
+        "Select all sources",
+        key="source_select_all",
+        on_change=toggle_all_sources,
+        help="Check to select every source; uncheck to deselect every source.",
+    )
+
     st.markdown("**Literature & Technical Sources**")
-    source_ads = st.checkbox("ADS / SciX", value=True)
-    source_arxiv = st.checkbox("arXiv", value=True)
-    source_ntrs = st.checkbox("NASA NTRS", value=True)
+    source_ads = st.checkbox(
+        "ADS / SciX",
+        key="source_ads",
+        on_change=sync_select_all_sources,
+    )
+    source_arxiv = st.checkbox(
+        "arXiv",
+        key="source_arxiv",
+        on_change=sync_select_all_sources,
+    )
+    source_ntrs = st.checkbox(
+        "NASA NTRS",
+        key="source_ntrs",
+        on_change=sync_select_all_sources,
+    )
 
     st.markdown("**Planetary Data System**")
     source_pds_data = st.checkbox(
         "PDS datasets / collections",
-        value=True,
+        key="source_pds_data",
+        on_change=sync_select_all_sources,
         disabled=not PDS_ENABLED,
         help=(
             "Temporarily disabled to reduce Streamlit compute usage. The PDS "
@@ -1504,7 +1556,8 @@ with st.sidebar:
     )
     source_pds_docs = st.checkbox(
         "PDS documentation",
-        value=False,
+        key="source_pds_docs",
+        on_change=sync_select_all_sources,
         disabled=not PDS_ENABLED,
         help=(
             "Temporarily disabled to reduce Streamlit compute usage."
