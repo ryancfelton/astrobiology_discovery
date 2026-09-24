@@ -33,7 +33,7 @@ PDS_ARCHIVE_SEARCH_ENDPOINT = "https://pds.nasa.gov/services/search/search"
 # Temporary feature flag. Keep all PDS retrieval/parsing code in place, but
 # disable the feature while Streamlit Community Cloud resource usage is being
 # evaluated. Set this back to True to restore PDS search.
-PDS_ENABLED = False
+PDS_ENABLED = True
 
 CURRENT_YEAR = datetime.now(timezone.utc).year
 
